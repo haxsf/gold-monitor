@@ -23,7 +23,7 @@ jobs:
           import requests
 
           SENDKEY = os.environ["GOLD_SENDKEY"]
-          HIGH_LIMIT, LOW_DAY, LOW_NIGHT = 790.0, 760.0, 750.0
+          HIGH_LIMIT, LOW_DAY, LOW_NIGHT = 795.0, 760.0, 750.0
           DAY_START, DAY_END = 5, 22
 
           now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)  # 北京时间

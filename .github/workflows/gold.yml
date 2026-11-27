@@ -1,7 +1,7 @@
 name: gold-price-monitor
 on:
   schedule:
-    - cron: "*/5 * * * *"   # 每5分钟(GitHub最低间隔,高峰期可能有1-3分钟延迟)
+    - cron: "*/3 * * * *"   # 每3分钟(GitHub可能限流至最低5分钟间隔)
   workflow_dispatch:          # 支持手动触发测试
 
 jobs:
@@ -23,7 +23,7 @@ jobs:
           import requests
 
           SENDKEY = os.environ["GOLD_SENDKEY"]
-          HIGH_LIMIT, HIGH_CRITICAL, LOW_DAY, LOW_NIGHT = 770.0, 790.0, 750.0, 740.0
+          HIGH_LIMIT, LOW_DAY, LOW_NIGHT = 790.0, 760.0, 750.0
           DAY_START, DAY_END = 5, 22
 
           now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)  # 北京时间
@@ -36,9 +36,7 @@ jobs:
           r.encoding = "gbk"
           price = float(r.text.split('"')[1].split(",")[0])
 
-          if price > HIGH_CRITICAL:
-              trig = f"⚠️ 重要：已突破上限 {HIGH_CRITICAL:g} 元/克"
-          elif price > HIGH_LIMIT:
+          if price > HIGH_LIMIT:
               trig = f"已超过上限 {HIGH_LIMIT:g} 元/克"
           elif price < low:
               trig = f"已跌破{period}下限 {low:g} 元/克"

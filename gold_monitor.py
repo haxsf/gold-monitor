@@ -87,53 +87,72 @@ def push_wechat(title, desp):
     return r.json().get("code") == 0
 
 def build_advisory(price, meta, st):
-    """根据当日振幅与近几日走势，生成策略调整提示。每个交易日每类最多提醒一次。"""
+    """根据当日振幅、盘中变动与近几日走势，生成策略调整提示。
+    提醒次数不设上限：同一交易日内出现"新的重大变动"会再次提醒——
+    ①振幅再扩大 >= 1 个百分点；②趋势累计涨跌再扩大 >= 1 个百分点或方向反转；
+    ③自上次提醒后价格再变动 >= 1%。小波动则静默。"""
     if not meta or not meta.get("prev"):
         return None
     qdate = str(meta.get("date", ""))
     notes = st.get("notes", {})
     if notes.get("date") != qdate:
-        notes = {"date": qdate, "vol": False, "trend": False}
+        notes = {"date": qdate, "vol_amp": 0.0, "trend_dir": "", "trend_cum": 0.0, "last_price": price}
         st["notes"] = notes
 
-    # 记录每日收盘价（每日首次运行时记录当日价）
     closes = st.get("closes", [])
     if not closes or closes[-1]["d"] != qdate:
         closes.append({"d": qdate, "c": price})
         st["closes"] = closes[-10:]
 
-    st_changed = notes != st.get("notes") or st.get("closes") != st.get("closes")
-
-    # 1) 波动加剧: 当日振幅 >= 3%
+    # 1) 波动加剧: 当日振幅 >= 3%; 振幅较上次已提醒水平再扩大 >= 1 个百分点 → 再次提醒
     amp = (meta["high"] - meta["low"]) / meta["prev"] * 100
     vol_msg = None
-    if amp >= 3.0 and not notes.get("vol"):
-        notes["vol"] = True
+    if amp >= 3.0 and amp - notes.get("vol_amp", 0.0) >= 1.0:
+        notes["vol_amp"] = amp
         vol_msg = (f"今日振幅已达 {amp:.1f}%，波动显著放大。建议："
                    "①固定档位补仓暂缓执行，等波动收敛后再按 762/752 档行动；"
                    "②已有持仓不追加、不追单；"
                    "③严守 750/795 防守位。")
 
-    # 2) 趋势转变: 最近3个交易日同方向且累计变动 >= 1.5%
+    # 2) 趋势转变: 近3个交易日同方向且累计 >= 1.5%; 方向反转或累计再扩大 >= 1 个百分点 → 再次提醒
     trend_msg = None
-    if len(st.get("closes", [])) >= 4 and not notes.get("trend"):
-        chg = [(st["closes"][i]["c"] / st["closes"][i-1]["c"] - 1) * 100
-               for i in range(len(st["closes"]) - 3, len(st["closes"]))]
-        if all(c > 0.2 for c in chg) and sum(chg) >= 1.5:
-            notes["trend"] = True
-            trend_msg = (f"近3个交易日连续上涨、累计 +{sum(chg):.1f}%，短期趋势转强。建议："
-                         "①762/752 补仓档大概率不触发，耐心等回调、勿追高；"
-                         "②若有效突破 795 并站稳，可用 2 万在回踩 795~798 时顺势买入；"
-                         "③803 止盈参考不变，到位分批减仓。")
-        elif all(c < -0.2 for c in chg) and sum(chg) <= -1.5:
-            notes["trend"] = True
-            trend_msg = (f"近3个交易日连续下跌、累计 {sum(chg):.1f}%，短期趋势转弱。建议："
-                         "①补仓档位整体下移一档执行（762→756、752→746），避免接飞刀；"
-                         "②跌破 750 严格执行减仓 1/3~1/2 纪律；"
-                         "③已有仓位等反弹至保本价 783.7 上方再考虑减仓换手。")
+    if len(closes) >= 4:
+        chg = [(closes[i]["c"] / closes[i-1]["c"] - 1) * 100
+               for i in range(len(closes) - 3, len(closes))]
+        s = sum(chg)
+        if all(c > 0.2 for c in chg) and s >= 1.5:
+            if notes.get("trend_dir") != "up" or s - notes.get("trend_cum", 0.0) >= 1.0:
+                notes["trend_dir"], notes["trend_cum"] = "up", s
+                trend_msg = (f"近3个交易日连续上涨、累计 +{s:.1f}%，短期趋势转强。建议："
+                             "①762/752 补仓档大概率不触发，耐心等回调、勿追高；"
+                             "②若有效突破 795 并站稳，可用 2 万在回踩 795~798 时顺势买入；"
+                             "③803 止盈参考不变，到位分批减仓。")
+        elif all(c < -0.2 for c in chg) and s <= -1.5:
+            if notes.get("trend_dir") != "down" or notes.get("trend_cum", 0.0) - s >= 1.0:
+                notes["trend_dir"], notes["trend_cum"] = "down", s
+                trend_msg = (f"近3个交易日连续下跌、累计 {s:.1f}%，短期趋势转弱。建议："
+                             "①补仓档位整体下移一档执行（762→756、752→746），避免接飞刀；"
+                             "②跌破 750 严格执行减仓 1/3~1/2 纪律；"
+                             "③已有仓位等反弹至保本价 783.7 上方再考虑减仓换手。")
+        elif notes.get("trend_dir"):
+            # 趋势信号消失 → 重置, 下次新趋势形成时立即提醒
+            notes["trend_dir"], notes["trend_cum"] = "", 0.0
 
-    if vol_msg or trend_msg:
-        return "；".join(x for x in (vol_msg, trend_msg) if x)
+    # 3) 盘中大变动: 自上次策略提醒后价格再变动 >= 1% → 再次提醒（不限次数）
+    big_msg = None
+    lp = notes.get("last_price")
+    if lp and lp > 0 and abs(price - lp) / lp * 100 >= 1.0:
+        pct = (price - lp) / lp * 100
+        notes["last_price"] = price
+        big_msg = (f"自上次提醒后金价{'快速上涨' if pct > 0 else '快速下跌'} {abs(pct):.1f}%"
+                   f"（{lp:g} → {price:g}）。建议："
+                   "①变动幅度大、方向未稳，先观察 15~30 分钟再决定动作；"
+                   "②若为大跌，检查 762/752 补仓档与 750 防守位是否接近；"
+                   "③若为大涨，检查 795 上限与 803 止盈位。")
+
+    msgs = [m for m in (vol_msg, trend_msg, big_msg) if m]
+    if msgs:
+        return "；".join(msgs)
     return None
 
 def main():
@@ -156,7 +175,7 @@ def main():
 
     st = load_state()
 
-    # ---- 波动/趋势自适应策略提示（每交易日每类最多提醒一次） ----
+    # ---- 波动/趋势自适应策略提示（出现新的大变动即再次提醒，小波动静默） ----
     advisory = build_advisory(price, meta, st)
 
     tiers = st.get("tiers", {})
@@ -207,7 +226,13 @@ def main():
         if advisory:
             desp += "\n\n---\n\n**📋 策略提示:** " + advisory
     elif advisory:
-        title = f"金价策略提醒:{'波动加剧' if '振幅' in advisory else '趋势转变'}"
+        if "振幅" in advisory:
+            kind = "波动加剧"
+        elif "趋势" in advisory:
+            kind = "趋势转变"
+        else:
+            kind = "盘中大变动"
+        title = f"金价策略提醒:{kind}"
         desp = (f"**当前金价:** {price:g} 元/克（{source}）\n\n**时间:** {now.strftime('%H:%M')}\n\n"
                 f"**📋 策略提示:** {advisory}")
     else:

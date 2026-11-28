@@ -21,8 +21,9 @@ LOW_DAY = 760.0     # 日间下限
 LOW_NIGHT = 750.0   # 晚间下限
 BUY_TIERS = [762.0, 752.0]  # 补仓档位（先到先报，从高到低）
 TP_LEVEL = 803.0    # 止盈参考位
+PULLBACK_PCT = 1.5  # 自近期高点回落幅度(%) → 出仓提醒
 DAY_START, DAY_END = 5, 22  # 日间: [5:00, 22:00)
-QUIET_START, QUIET_END = 23, 5  # 深夜静默窗口 [23:00, 次日5:00): 只发操作类提醒(越限/补仓/止盈), 策略类不发
+QUIET_START, QUIET_END = 23, 5  # 深夜窗口 [23:00, 次日5:00): 监测照常, 仅静默"不紧急"的策略类消息; 大事(越限/补仓/止盈/高位回落/盘中大变动)照发
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE, "gold_monitor.log")
 STATE_FILE = os.path.join(BASE, "gold_state.json")
@@ -87,11 +88,12 @@ def push_wechat(title, desp):
         data={"title": title[:32], "desp": desp}, timeout=TIMEOUT, verify=CA)
     return r.json().get("code") == 0
 
-def build_advisory(price, meta, st):
+def build_advisory(price, meta, st, quiet=False):
     """根据当日振幅、盘中变动与近几日走势，生成策略调整提示。
     提醒次数不设上限：同一交易日内出现"新的重大变动"会再次提醒——
     ①振幅再扩大 >= 1 个百分点；②趋势累计涨跌再扩大 >= 1 个百分点或方向反转；
-    ③自上次提醒后价格再变动 >= 1%。小波动则静默。"""
+    ③自上次提醒后价格再变动 >= 1%。小波动则静默。
+    quiet=True(深夜窗口): 仅保留"盘中大变动"(可能需要尽快处理), 波动/趋势等不紧急提示不发。"""
     if not meta or not meta.get("prev"):
         return None
     qdate = str(meta.get("date", ""))
@@ -146,6 +148,8 @@ def build_advisory(price, meta, st):
         big_msg = (f"金价快速{'涨' if pct > 0 else '跌'}{abs(pct):.1f}%（{lp:g}→{price:g}）。"
                    "操作：先观察30分钟再动；跌看补仓档，涨看上限/止盈。")
 
+    if quiet:
+        vol_msg = trend_msg = None  # 深夜: 波动/趋势属非紧急信息, 静默
     msgs = [m for m in (vol_msg, trend_msg, big_msg) if m]
     if msgs:
         return "；".join(msgs)
@@ -221,16 +225,16 @@ def main():
 
     st = load_state()
 
-    # ---- 波动/趋势自适应策略提示（出现新的大变动即再次提醒，小波动静默） ----
-    advisory = build_advisory(price, meta, st)
+    # ---- 深夜窗口判定: 监测照常, 仅影响消息类型 ----
+    in_quiet = (now.hour >= QUIET_START or now.hour < QUIET_END)
+
+    # ---- 波动/趋势自适应策略提示（大变动再提醒, 小波动静默; 深夜仅保留盘中大变动） ----
+    advisory = build_advisory(price, meta, st, quiet=in_quiet)
 
     # ---- 区间自适应: 根据近3日趋势/振幅动态调整监测区间 ----
     eff, notice = compute_ranges(st)
-
-    # ---- 深夜静默窗口(23:00~次日5:00): 状态照常记录, 但策略/区间类消息不发 ----
-    in_quiet = (now.hour >= QUIET_START or now.hour < QUIET_END)
     if in_quiet:
-        advisory = notice = None
+        notice = None  # 区间调整属配置类信息, 深夜不推送
     low = eff["low_day"] if is_day else eff["low_night"]
 
     # 区间档位变化时, 重置档位/止盈的"已提醒"状态(在新档位重新生效)
@@ -250,12 +254,29 @@ def main():
     for lvl in eff["tiers"]:
         key = str(int(lvl))
         if price <= lvl and not tiers.get(key):
-            extras.append(f"补仓档位{lvl:g}已触及")
+            extras.append(f"补仓档位{lvl:g}已触及, 可买入")
             tiers[key] = True
             changed = True
         elif price > lvl + RESET_GAP and tiers.get(key):
             tiers[key] = False
             changed = True
+
+    # ---- 高位回落: 自近期高点回落 >= 1.5% → 出仓提醒(操作类, 深夜也发); 创新高后重置 ----
+    closes_hi = max((c["c"] for c in st.get("closes", [])[-5:]), default=price)
+    day_hi = meta["high"] if meta else price
+    recent_high = max(day_hi, closes_hi)
+    pb = st.get("pullback", {})
+    if recent_high > pb.get("high", 0):
+        pb = {"high": recent_high, "done": False}  # 创新高 → 重新武装
+    drop_pct = (pb["high"] - price) / pb["high"] * 100 if pb.get("high") else 0.0
+    if drop_pct >= PULLBACK_PCT and not pb.get("done"):
+        extras.append(f"高位回落{drop_pct:.1f}%({pb['high']:g}→{price:g}), 可减仓/止盈")
+        pb["done"] = True
+        changed = True
+    elif pb.get("done") and drop_pct < PULLBACK_PCT / 3:
+        pb["done"] = False
+        changed = True
+    st["pullback"] = pb
 
     # ---- 止盈参考位: 升破即提醒一次, 回落3元以上重置 ----
     if price >= eff["tp"] and not tp_done:

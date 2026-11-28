@@ -22,6 +22,7 @@ LOW_NIGHT = 750.0   # 晚间下限
 BUY_TIERS = [762.0, 752.0]  # 补仓档位（先到先报，从高到低）
 TP_LEVEL = 803.0    # 止盈参考位
 DAY_START, DAY_END = 5, 22  # 日间: [5:00, 22:00)
+QUIET_START, QUIET_END = 23, 5  # 深夜静默窗口 [23:00, 次日5:00): 只发操作类提醒(越限/补仓/止盈), 策略类不发
 BASE = os.path.dirname(os.path.abspath(__file__))
 LOG_FILE = os.path.join(BASE, "gold_monitor.log")
 STATE_FILE = os.path.join(BASE, "gold_state.json")
@@ -114,10 +115,7 @@ def build_advisory(price, meta, st):
     vol_msg = None
     if amp >= 3.0 and amp - notes.get("vol_amp", 0.0) >= 1.0:
         notes["vol_amp"] = amp
-        vol_msg = (f"今日振幅已达 {amp:.1f}%，波动显著放大。建议："
-                   "①固定档位补仓暂缓执行，等波动收敛后再按 762/752 档行动；"
-                   "②已有持仓不追加、不追单；"
-                   "③严守 750/795 防守位。")
+        vol_msg = f"今日振幅{amp:.1f}%，波动大。操作：暂停补仓，持仓观望，守住上下限再动。"
 
     # 2) 趋势转变: 近3个交易日同方向且累计 >= 1.5%; 方向反转或累计再扩大 >= 1 个百分点 → 再次提醒
     trend_msg = None
@@ -128,17 +126,13 @@ def build_advisory(price, meta, st):
         if all(c > 0.2 for c in chg) and s >= 1.5:
             if notes.get("trend_dir") != "up" or s - notes.get("trend_cum", 0.0) >= 1.0:
                 notes["trend_dir"], notes["trend_cum"] = "up", s
-                trend_msg = (f"近3个交易日连续上涨、累计 +{s:.1f}%，短期趋势转强。建议："
-                             "①762/752 补仓档大概率不触发，耐心等回调、勿追高；"
-                             "②若有效突破 795 并站稳，可用 2 万在回踩 795~798 时顺势买入；"
-                             "③803 止盈参考不变，到位分批减仓。")
+                trend_msg = (f"近3日连涨{s:.1f}%，趋势向上。操作：不追高；"
+                             "突破795站稳后回踩795~798买2万；到803减1/3。")
         elif all(c < -0.2 for c in chg) and s <= -1.5:
             if notes.get("trend_dir") != "down" or notes.get("trend_cum", 0.0) - s >= 1.0:
                 notes["trend_dir"], notes["trend_cum"] = "down", s
-                trend_msg = (f"近3个交易日连续下跌、累计 {s:.1f}%，短期趋势转弱。建议："
-                             "①补仓档位整体下移一档执行（762→756、752→746），避免接飞刀；"
-                             "②跌破 750 严格执行减仓 1/3~1/2 纪律；"
-                             "③已有仓位等反弹至保本价 783.7 上方再考虑减仓换手。")
+                trend_msg = (f"近3日连跌{s:.1f}%，趋势向下。操作："
+                             "补仓档下移到756/746再接；跌破750减仓1/3~1/2；反弹过783.7再卖。")
         elif notes.get("trend_dir"):
             # 趋势信号消失 → 重置, 下次新趋势形成时立即提醒
             notes["trend_dir"], notes["trend_cum"] = "", 0.0
@@ -149,11 +143,8 @@ def build_advisory(price, meta, st):
     if lp and lp > 0 and abs(price - lp) / lp * 100 >= 1.0:
         pct = (price - lp) / lp * 100
         notes["last_price"] = price
-        big_msg = (f"自上次提醒后金价{'快速上涨' if pct > 0 else '快速下跌'} {abs(pct):.1f}%"
-                   f"（{lp:g} → {price:g}）。建议："
-                   "①变动幅度大、方向未稳，先观察 15~30 分钟再决定动作；"
-                   "②若为大跌，检查 762/752 补仓档与 750 防守位是否接近；"
-                   "③若为大涨，检查 795 上限与 803 止盈位。")
+        big_msg = (f"金价快速{'涨' if pct > 0 else '跌'}{abs(pct):.1f}%（{lp:g}→{price:g}）。"
+                   "操作：先观察30分钟再动；跌看补仓档，涨看上限/止盈。")
 
     msgs = [m for m in (vol_msg, trend_msg, big_msg) if m]
     if msgs:
@@ -235,6 +226,11 @@ def main():
 
     # ---- 区间自适应: 根据近3日趋势/振幅动态调整监测区间 ----
     eff, notice = compute_ranges(st)
+
+    # ---- 深夜静默窗口(23:00~次日5:00): 状态照常记录, 但策略/区间类消息不发 ----
+    in_quiet = (now.hour >= QUIET_START or now.hour < QUIET_END)
+    if in_quiet:
+        advisory = notice = None
     low = eff["low_day"] if is_day else eff["low_night"]
 
     # 区间档位变化时, 重置档位/止盈的"已提醒"状态(在新档位重新生效)

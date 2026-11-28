@@ -2,53 +2,31 @@ name: gold-price-monitor
 on:
   schedule:
     - cron: "*/3 * * * *"   # 每3分钟(GitHub可能限流至最低5分钟间隔)
-  workflow_dispatch:          # 支持手动触发测试
+  workflow_dispatch:
 
 jobs:
   monitor:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: 恢复提醒状态(保证档位只提醒一次)
+        uses: actions/cache/restore@v4
+        with:
+          path: gold_state.json
+          key: gold-state-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            gold-state-
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
       - run: pip install requests
-      - name: 监测金价并按阈值推送微信
+      - name: 监测金价并按规则推送
         env:
           GOLD_SENDKEY: ${{ secrets.GOLD_SENDKEY }}
-        run: |
-          # 仅推送通道使用云端密钥, 金价API与阈值逻辑与本地脚本一致
-          python3 - <<'PYEOF'
-          import os, datetime
-          import requests
-
-          SENDKEY = os.environ["GOLD_SENDKEY"]
-          HIGH_LIMIT, LOW_DAY, LOW_NIGHT = 795.0, 760.0, 750.0
-          DAY_START, DAY_END = 5, 22
-
-          now = datetime.datetime.utcnow() + datetime.timedelta(hours=8)  # 北京时间
-          is_day = DAY_START <= now.hour < DAY_END
-          low = LOW_DAY if is_day else LOW_NIGHT
-          period = "日间" if is_day else "晚间"
-
-          r = requests.get("https://hq.sinajs.cn/list=gds_AUTD",
-                           headers={"Referer": "https://finance.sina.com.cn"}, timeout=15)
-          r.encoding = "gbk"
-          price = float(r.text.split('"')[1].split(",")[0])
-
-          if price > HIGH_LIMIT:
-              trig = f"已超过上限 {HIGH_LIMIT:g} 元/克"
-          elif price < low:
-              trig = f"已跌破{period}下限 {low:g} 元/克"
-          else:
-              print(f"SILENT ({period}) {price}")
-              raise SystemExit(0)
-
-          t = now.strftime("%H:%M")
-          resp = requests.post(
-              f"https://sctapi.ftqq.com/{SENDKEY}.send",
-              data={"title": f"金价提醒:{price:g}元/克 {trig}"[:32],
-                    "desp": f"**当前金价:** {price:g} 元/克（Au(T+D)）\n\n**时间:** {t}\n\n**触发:** {trig}"},
-              timeout=15)
-          print(f"ALERT ({period}) price={price} -> {resp.json()}")
-          PYEOF
+        run: python3 gold_monitor.py
+      - name: 保存提醒状态
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: gold_state.json
+          key: gold-state-${{ github.run_id }}-${{ github.run_attempt }}

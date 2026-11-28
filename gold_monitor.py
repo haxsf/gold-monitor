@@ -49,35 +49,92 @@ def save_state(st):
         pass
 
 def get_gold_price():
-    """获取金价(元/克)。主源: 上金所 Au(T+D); 备源: 伦敦金XAU折算。"""
+    """获取金价。返回 (最新价, 来源, meta) ，meta含昨收/最高/最低/日期，用于波动与趋势分析。"""
     headers = {"Referer": "https://finance.sina.com.cn"}
     try:
         r = requests.get("https://hq.sinajs.cn/list=gds_AUTD", headers=headers, timeout=TIMEOUT, verify=CA)
         r.encoding = "gbk"
-        price = float(r.text.split('"')[1].split(",")[0])
+        p = r.text.split('"')[1].split(",")
+        price = float(p[0])
         if price > 0:
-            return price, "Au(T+D)"
+            meta = {"prev": float(p[3]), "high": float(p[4]), "low": float(p[5]), "date": p[12]}
+            return price, "Au(T+D)", meta
     except Exception:
         pass
     try:
         r1 = requests.get("https://hq.sinajs.cn/list=hf_XAU", headers=headers, timeout=TIMEOUT, verify=CA)
         r1.encoding = "gbk"
-        xau = float(r1.text.split('"')[1].split(",")[0])
+        p1 = r1.text.split('"')[1].split(",")
+        xau = float(p1[0])
         r2 = requests.get("https://hq.sinajs.cn/list=fx_susdcny", headers=headers, timeout=TIMEOUT, verify=CA)
         r2.encoding = "gbk"
         usdcny = float(r2.text.split('"')[1].split(",")[9])
-        price = xau * usdcny / 31.1035
+        price = round(xau * usdcny / 31.1035, 2)
         if price > 0:
-            return round(price, 2), "伦敦金折算"
+            meta = {"prev": round(float(p1[1]) * usdcny / 31.1035, 2),
+                    "high": round(float(p1[4]) * usdcny / 31.1035, 2),
+                    "low": round(float(p1[5]) * usdcny / 31.1035, 2),
+                    "date": p1[12]}
+            return price, "伦敦金折算", meta
     except Exception:
         pass
-    return None, None
+    return None, None, None
 
 def push_wechat(title, desp):
     r = requests.post(
         f"https://sctapi.ftqq.com/{SENDKEY}.send",
         data={"title": title[:32], "desp": desp}, timeout=TIMEOUT, verify=CA)
     return r.json().get("code") == 0
+
+def build_advisory(price, meta, st):
+    """根据当日振幅与近几日走势，生成策略调整提示。每个交易日每类最多提醒一次。"""
+    if not meta or not meta.get("prev"):
+        return None
+    qdate = str(meta.get("date", ""))
+    notes = st.get("notes", {})
+    if notes.get("date") != qdate:
+        notes = {"date": qdate, "vol": False, "trend": False}
+        st["notes"] = notes
+
+    # 记录每日收盘价（每日首次运行时记录当日价）
+    closes = st.get("closes", [])
+    if not closes or closes[-1]["d"] != qdate:
+        closes.append({"d": qdate, "c": price})
+        st["closes"] = closes[-10:]
+
+    st_changed = notes != st.get("notes") or st.get("closes") != st.get("closes")
+
+    # 1) 波动加剧: 当日振幅 >= 3%
+    amp = (meta["high"] - meta["low"]) / meta["prev"] * 100
+    vol_msg = None
+    if amp >= 3.0 and not notes.get("vol"):
+        notes["vol"] = True
+        vol_msg = (f"今日振幅已达 {amp:.1f}%，波动显著放大。建议："
+                   "①固定档位补仓暂缓执行，等波动收敛后再按 762/752 档行动；"
+                   "②已有持仓不追加、不追单；"
+                   "③严守 750/795 防守位。")
+
+    # 2) 趋势转变: 最近3个交易日同方向且累计变动 >= 1.5%
+    trend_msg = None
+    if len(st.get("closes", [])) >= 4 and not notes.get("trend"):
+        chg = [(st["closes"][i]["c"] / st["closes"][i-1]["c"] - 1) * 100
+               for i in range(len(st["closes"]) - 3, len(st["closes"]))]
+        if all(c > 0.2 for c in chg) and sum(chg) >= 1.5:
+            notes["trend"] = True
+            trend_msg = (f"近3个交易日连续上涨、累计 +{sum(chg):.1f}%，短期趋势转强。建议："
+                         "①762/752 补仓档大概率不触发，耐心等回调、勿追高；"
+                         "②若有效突破 795 并站稳，可用 2 万在回踩 795~798 时顺势买入；"
+                         "③803 止盈参考不变，到位分批减仓。")
+        elif all(c < -0.2 for c in chg) and sum(chg) <= -1.5:
+            notes["trend"] = True
+            trend_msg = (f"近3个交易日连续下跌、累计 {sum(chg):.1f}%，短期趋势转弱。建议："
+                         "①补仓档位整体下移一档执行（762→756、752→746），避免接飞刀；"
+                         "②跌破 750 严格执行减仓 1/3~1/2 纪律；"
+                         "③已有仓位等反弹至保本价 783.7 上方再考虑减仓换手。")
+
+    if vol_msg or trend_msg:
+        return "；".join(x for x in (vol_msg, trend_msg) if x)
+    return None
 
 def main():
     test = "--test" in sys.argv
@@ -92,12 +149,16 @@ def main():
         print("test push:", "OK" if ok else "FAILED")
         return
 
-    price, source = get_gold_price()
+    price, source, meta = get_gold_price()
     if price is None:
         log("SILENT (price unavailable)")
         return
 
     st = load_state()
+
+    # ---- 波动/趋势自适应策略提示（每交易日每类最多提醒一次） ----
+    advisory = build_advisory(price, meta, st)
+
     tiers = st.get("tiers", {})
     tp_done = st.get("tp", False)
     changed = False
@@ -137,10 +198,18 @@ def main():
         if extras:
             title += "(含档位)"
             desp += "\n\n**同时触及:** " + "；".join(extras)
+        if advisory:
+            desp += "\n\n---\n\n**📋 策略提示:** " + advisory
     elif extras:
         title = f"金价提醒:{extras[0]} 现价{price:g}"
         desp = (f"**当前金价:** {price:g} 元/克（{source}）\n\n**时间:** {now.strftime('%H:%M')}\n\n"
                 + "\n\n".join(f"**{e}**" for e in extras))
+        if advisory:
+            desp += "\n\n---\n\n**📋 策略提示:** " + advisory
+    elif advisory:
+        title = f"金价策略提醒:{'波动加剧' if '振幅' in advisory else '趋势转变'}"
+        desp = (f"**当前金价:** {price:g} 元/克（{source}）\n\n**时间:** {now.strftime('%H:%M')}\n\n"
+                f"**📋 策略提示:** {advisory}")
     else:
         log(f"SILENT ({period}) price={price} source={source}")
         return

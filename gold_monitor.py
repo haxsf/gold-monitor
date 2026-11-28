@@ -96,16 +96,21 @@ def build_advisory(price, meta, st):
     qdate = str(meta.get("date", ""))
     notes = st.get("notes", {})
     if notes.get("date") != qdate:
-        notes = {"date": qdate, "vol_amp": 0.0, "trend_dir": "", "trend_cum": 0.0, "last_price": price}
+        # 换日重置振幅与盘中基准价, 但保留趋势记忆(避免持续趋势每天重复提醒)
+        notes = {"date": qdate, "vol_amp": 0.0, "last_price": price,
+                 "trend_dir": notes.get("trend_dir", ""), "trend_cum": notes.get("trend_cum", 0.0)}
         st["notes"] = notes
 
     closes = st.get("closes", [])
+    amp = (meta["high"] - meta["low"]) / meta["prev"] * 100
     if not closes or closes[-1]["d"] != qdate:
-        closes.append({"d": qdate, "c": price})
+        closes.append({"d": qdate, "c": price, "amp": round(amp, 2)})
         st["closes"] = closes[-10:]
+    else:
+        closes[-1]["c"] = price          # 当日最新价(近似收盘价, 供趋势/区间计算)
+        closes[-1]["amp"] = round(amp, 2)
 
     # 1) 波动加剧: 当日振幅 >= 3%; 振幅较上次已提醒水平再扩大 >= 1 个百分点 → 再次提醒
-    amp = (meta["high"] - meta["low"]) / meta["prev"] * 100
     vol_msg = None
     if amp >= 3.0 and amp - notes.get("vol_amp", 0.0) >= 1.0:
         notes["vol_amp"] = amp
@@ -155,11 +160,61 @@ def build_advisory(price, meta, st):
         return "；".join(msgs)
     return None
 
+def compute_ranges(st):
+    """根据近3日趋势与平均振幅, 自适应调整监测区间。
+    规则: 趋势上行→上限/止盈上移5元, 补仓档上移6元; 趋势下行→下限下移5元, 补仓档下移6元;
+    近3日平均振幅>=2.5%(高波动)→上下限外扩5元, 补仓档再下移3元(等更好价格)。
+    返回 (有效区间dict, 区间调整通知或None)。区间变化时通知会推送一次。"""
+    closes = st.get("closes", [])
+    trend, s = "", 0.0
+    if len(closes) >= 4:
+        chg = [(closes[i]["c"] / closes[i-1]["c"] - 1) * 100
+               for i in range(len(closes) - 3, len(closes))]
+        s = sum(chg)
+        if all(c > 0.2 for c in chg) and s >= 1.5:
+            trend = "up"
+        elif all(c < -0.2 for c in chg) and s <= -1.5:
+            trend = "down"
+    amps = [c.get("amp") for c in closes[-3:] if c.get("amp") is not None]
+    avg_amp = sum(amps) / len(amps) if amps else 0.0
+    high_vol = len(amps) >= 2 and avg_amp >= 2.5
+
+    d_up = 5.0 if trend == "up" else 0.0
+    d_down = 5.0 if trend == "down" else 0.0
+    d_vol = 5.0 if high_vol else 0.0
+    tier_shift = (-6.0 if trend == "down" else 6.0 if trend == "up" else 0.0) \
+                 + (-3.0 if high_vol else 0.0)
+
+    eff = {
+        "high": HIGH_LIMIT + d_up + d_vol,
+        "low_day": LOW_DAY - d_down - d_vol,
+        "low_night": LOW_NIGHT - d_down - d_vol,
+        "tiers": [round(t + tier_shift, 1) for t in BUY_TIERS],
+        "tp": TP_LEVEL + d_up,
+    }
+    regime = (trend or "flat") + ("+highvol" if high_vol else "")
+
+    notice = None
+    if st.get("regime") and regime != st["regime"] and (trend or high_vol):
+        # 仅在形成明确的新状态(趋势/高波动)时通知; 回归平静(基准区间)则静默重置
+        reasons = []
+        if trend == "up":
+            reasons.append(f"近3个交易日累计上涨{s:+.1f}%，趋势转强")
+        elif trend == "down":
+            reasons.append(f"近3个交易日累计下跌{s:+.1f}%，趋势转弱")
+        if high_vol:
+            reasons.append(f"近3日平均振幅{avg_amp:.1f}%，波动放大")
+        tiers_txt = "/".join(f"{t:g}" for t in eff["tiers"])
+        notice = (f"监测区间已自适应调整（{'；'.join(reasons)}）。新区间: "
+                  f"上限 {eff['high']:g}、日间下限 {eff['low_day']:g}、晚间下限 {eff['low_night']:g}、"
+                  f"补仓档 {tiers_txt}、止盈参考 {eff['tp']:g}。")
+    st["regime"] = regime
+    return eff, notice
+
 def main():
     test = "--test" in sys.argv
     now = datetime.datetime.now()
     is_day = DAY_START <= now.hour < DAY_END
-    low = LOW_DAY if is_day else LOW_NIGHT
     period = "日间" if is_day else "晚间"
 
     if test:
@@ -178,13 +233,25 @@ def main():
     # ---- 波动/趋势自适应策略提示（出现新的大变动即再次提醒，小波动静默） ----
     advisory = build_advisory(price, meta, st)
 
+    # ---- 区间自适应: 根据近3日趋势/振幅动态调整监测区间 ----
+    eff, notice = compute_ranges(st)
+    low = eff["low_day"] if is_day else eff["low_night"]
+
+    # 区间档位变化时, 重置档位/止盈的"已提醒"状态(在新档位重新生效)
+    if st.get("tiers_cfg") != eff["tiers"]:
+        st["tiers"] = {}
+        st["tiers_cfg"] = eff["tiers"]
+    if st.get("tp_cfg") != eff["tp"]:
+        st["tp"] = False
+        st["tp_cfg"] = eff["tp"]
+
     tiers = st.get("tiers", {})
     tp_done = st.get("tp", False)
     changed = False
 
     # ---- 补仓档位: 跌破即提醒一次, 回升3元以上重置 ----
     extras = []
-    for lvl in BUY_TIERS:
+    for lvl in eff["tiers"]:
         key = str(int(lvl))
         if price <= lvl and not tiers.get(key):
             extras.append(f"补仓档位{lvl:g}已触及")
@@ -195,21 +262,28 @@ def main():
             changed = True
 
     # ---- 止盈参考位: 升破即提醒一次, 回落3元以上重置 ----
-    if price >= TP_LEVEL and not tp_done:
-        extras.append(f"止盈参考位{TP_LEVEL:g}已升破")
+    if price >= eff["tp"] and not tp_done:
+        extras.append(f"止盈参考位{eff['tp']:g}已升破")
         tp_done = True
         changed = True
-    elif price < TP_LEVEL - RESET_GAP and tp_done:
+    elif price < eff["tp"] - RESET_GAP and tp_done:
         tp_done = False
         changed = True
 
     st["tiers"], st["tp"] = tiers, tp_done
     save_state(st)
 
-    # ---- 阈值判断 ----
-    threshold_hit = price > HIGH_LIMIT or price < low
-    trig = (f"已超过上限 {HIGH_LIMIT:g} 元/克" if price > HIGH_LIMIT
+    # ---- 阈值判断(使用自适应后的区间) ----
+    threshold_hit = price > eff["high"] or price < low
+    trig = (f"已超过上限 {eff['high']:g} 元/克" if price > eff["high"]
             else (f"已跌破{period}下限 {low:g} 元/克" if price < low else None))
+
+    # 附加内容: 策略提示 + 区间调整通知
+    tail = ""
+    if advisory:
+        tail += "\n\n---\n\n**📋 策略提示:** " + advisory
+    if notice:
+        tail += "\n\n---\n\n**📊 区间调整:** " + notice
 
     if threshold_hit:
         title = f"金价提醒:{price:g}元/克 {trig}"
@@ -217,30 +291,30 @@ def main():
         if extras:
             title += "(含档位)"
             desp += "\n\n**同时触及:** " + "；".join(extras)
-        if advisory:
-            desp += "\n\n---\n\n**📋 策略提示:** " + advisory
+        desp += tail
     elif extras:
         title = f"金价提醒:{extras[0]} 现价{price:g}"
         desp = (f"**当前金价:** {price:g} 元/克（{source}）\n\n**时间:** {now.strftime('%H:%M')}\n\n"
-                + "\n\n".join(f"**{e}**" for e in extras))
-        if advisory:
-            desp += "\n\n---\n\n**📋 策略提示:** " + advisory
-    elif advisory:
-        if "振幅" in advisory:
-            kind = "波动加剧"
-        elif "趋势" in advisory:
-            kind = "趋势转变"
-        else:
-            kind = "盘中大变动"
-        title = f"金价策略提醒:{kind}"
-        desp = (f"**当前金价:** {price:g} 元/克（{source}）\n\n**时间:** {now.strftime('%H:%M')}\n\n"
-                f"**📋 策略提示:** {advisory}")
+                + "\n\n".join(f"**{e}**" for e in extras)) + tail
+    elif advisory or notice:
+        if notice and not advisory:
+            title = "金价区间调整提醒"
+        elif advisory:
+            if "振幅" in advisory:
+                kind = "波动加剧"
+            elif "趋势" in advisory:
+                kind = "趋势转变"
+            else:
+                kind = "盘中大变动"
+            title = f"金价策略提醒:{kind}"
+        desp = (f"**当前金价:** {price:g} 元/克（{source}）\n\n**时间:** {now.strftime('%H:%M')}\n\n") + tail
     else:
         log(f"SILENT ({period}) price={price} source={source}")
         return
 
     ok = push_wechat(title, desp)
-    log(f"ALERT ({period}) price={price} trig={trig} extras={extras} push={'OK' if ok else 'FAILED'}")
+    log(f"ALERT ({period}) price={price} trig={trig} extras={extras} "
+        f"range={eff['high']:g}/{low:g} push={'OK' if ok else 'FAILED'}")
 
 if __name__ == "__main__":
     try:
